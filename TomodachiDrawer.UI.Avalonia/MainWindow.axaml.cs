@@ -27,7 +27,6 @@ namespace TomodachiDrawer.UI.Avalonia;
 
 public partial class MainWindow : Window
 {
-    private const string firmwareFileName = "TomodachiDrawer.Firmware.uf2";
 
     private string _currentImagePath = string.Empty;
     private readonly CancellationTokenSource _cts = new();
@@ -68,7 +67,7 @@ public partial class MainWindow : Window
         this.Title = $"TomodachiDrawer - {GetVersionString(false)}";
 #endif
 
-        StartRP2040Polling();
+        StartESP32Polling();
         if (CheckForUpdatesCheckBox.IsChecked)
             _ = PerformAsyncUpdateCheck();
 
@@ -185,26 +184,25 @@ public partial class MainWindow : Window
         base.OnClosed(e);
     }
 
-    // ── RP2040 polling ────────────────────────────────────────────────
+    // ── ESP32 polling ────────────────────────────────────────────────
 
-    private void StartRP2040Polling()
+    private void StartESP32Polling()
     {
         _ = Task.Run(async () =>
         {
             bool lastState = false;
             while (!_cts.Token.IsCancellationRequested)
             {
-                var path = UF2Flasher.FindRP2040Drive();
+                var port = ESP32Flasher.FindESP32Port();
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     bool hasImage = !string.IsNullOrEmpty(_currentImagePath);
 
-                    // ExportUF2 only needs an image — no RP2040 required
                     ExportUF2Button.IsEnabled = hasImage;
 
-                    if (path != null)
+                    if (port != null)
                     {
-                        RP2040StatusLabel.Text = $"RP2040 found: {path}";
+                        RP2040StatusLabel.Text = $"ESP32 found: {port}";
                         RP2040StatusLabel.Foreground = Brushes.Green;
 
                         FlashFirmwareButton.IsEnabled = !BusyExporting;
@@ -212,13 +210,13 @@ public partial class MainWindow : Window
                         ExportUF2Button.IsEnabled = hasImage && !BusyExporting;
                         if (!lastState)
                         {
-                            AppendLog($"RP2040 connected @ {path}");
+                            AppendLog($"ESP32 connected @ {port}");
                             lastState = true;
                         }
                     }
                     else
                     {
-                        RP2040StatusLabel.Text = "RP2040 not found";
+                        RP2040StatusLabel.Text = "ESP32 not found";
                         RP2040StatusLabel.Foreground = Brushes.Red;
 
                         FlashFirmwareButton.IsEnabled = false;
@@ -226,20 +224,14 @@ public partial class MainWindow : Window
                         ExportUF2Button.IsEnabled = hasImage && !BusyExporting;
                         if (lastState)
                         {
-                            AppendLog("RP2040 disconnected...");
+                            AppendLog("ESP32 disconnected...");
                             lastState = false;
                         }
                     }
                 });
 
-                try
-                {
-                    await Task.Delay(1000, _cts.Token);
-                }
-                catch (System.OperationCanceledException)
-                {
-                    break;
-                }
+                try { await Task.Delay(1000, _cts.Token); }
+                catch (OperationCanceledException) { break; }
             }
         });
     }
@@ -475,47 +467,44 @@ public partial class MainWindow : Window
 
     private async void ExportRP2040Button_Click(object? sender, RoutedEventArgs e)
     {
-        if (string.IsNullOrEmpty(_currentImagePath))
-            return;
+        if (string.IsNullOrEmpty(_currentImagePath)) return;
 
         if (_currentSettings.SelectedSwitchVersion == SwitchVersion.None)
         {
-            _ = ShowMessageAsync(
-                "Select Switch Version",
-                "For compatibility, you must select a switch version in the dropdown."
-                    + "\n\nSwitch 1 is more prone to desyncs, so this avoids certain things that are particularly prone to desyncing."
-                    + "\nPlease be aware that even with Switch 1 selected, desyncs are unfortunately expected due to inconsistent and unpredictable lag in the drawing UI."
-            );
+            _ = ShowMessageAsync("Select Switch Version",
+                "For compatibility, you must select a switch version in the dropdown.");
+            return;
+        }
+
+        var port = ESP32Flasher.FindESP32Port();
+        if (port == null)
+        {
+            _ = ShowMessageAsync("ESP32 not found",
+                "Could not find ESP32 on any serial port. Make sure it is connected normally (not in download mode).");
             return;
         }
 
         var imagePath = _currentImagePath;
         var denoiser = DenoisingComboBox.SelectedItem?.ToString();
         var tspLimit = (float)(TSPTimeLimitUpDown.Value ?? 0.5m);
-
-        BusyExporting = true;
-        ExportRP2040Button.IsEnabled = false;
-        TimeSpan totalTime = TimeSpan.MaxValue;
         var settings = GetQuantizerSettings();
         var enableExperimental = EnableExperimentalCheckBox.IsChecked ?? false;
         var enableHome = EnableHomeCanvas.IsChecked ?? false;
 
+        BusyExporting = true;
+        ExportRP2040Button.IsEnabled = false;
+        TimeSpan totalTime = TimeSpan.MaxValue;
+
         await Task.Run(async () =>
         {
-            string tempPath = Path.Combine(
-                Path.GetTempPath(),
-                $"rp2040output{System.Random.Shared.Next(1000000, 9999999)}.tdld"
-            );
+            string tempPath = Path.Combine(Path.GetTempPath(),
+                $"esp32output{Random.Shared.Next(1000000, 9999999)}.tdld");
 
-            AppendLog($"Exporting to RP2040 flash ({Path.GetFileName(tempPath)})");
+            AppendLog("Generating inputs...");
             var timingSink = new TimingSink();
-            var drawer = new CanvasDrawer(
-                timingSink,
-                _currentSettings.SelectedSwitchVersion,
-                AppendLog
-            );
+            var drawer = new CanvasDrawer(timingSink, _currentSettings.SelectedSwitchVersion, AppendLog);
             drawer.ConnectAndConfirmController();
-            AppendLog("Starting to generate inputs...");
+
             var drawSettings = new DrawImageSettings()
             {
                 QuantizerSettings = settings,
@@ -532,26 +521,21 @@ public partial class MainWindow : Window
             timingSink.ReplayTo(fileSink);
             fileSink.Dispose();
 
-            var tdldBytes = File.ReadAllBytes(tempPath);
-            var uf2Bytes = UF2Flasher.BuildTDLDUF2(tdldBytes);
-            var drivePath = UF2Flasher.FindRP2040Drive();
+            AppendLog($"Flashing to ESP32 on {port}...");
+            var progress = new Progress<string>(AppendLog);
+            var (success, log) = await ESP32Flasher.FlashTDLDAsync(tempPath, port, progress);
 
-            if (uf2Bytes != null && uf2Bytes.Length > 0 && drivePath != null)
-            {
-                File.WriteAllBytes(Path.Combine(drivePath, "tdld_image.uf2"), uf2Bytes);
-                AppendLog(
-                    "Wrote to RP2040 flash. Unplug the RP2040 and plug it into the switch without holding any button."
-                );
-            }
+            if (success)
+                AppendLog("Flashed! Unplug the ESP32 and connect it to the Switch.");
+            else
+                AppendLog($"Flash failed:\n{log}");
 
-            if (File.Exists(tempPath))
-                File.Delete(tempPath);
+            if (File.Exists(tempPath)) File.Delete(tempPath);
             totalTime = timingSink.TotalTime;
         });
 
         BusyExporting = false;
         ExportRP2040Button.IsEnabled = true;
-
         SetEstimate(totalTime);
     }
 
@@ -580,11 +564,11 @@ public partial class MainWindow : Window
         var file = await StorageProvider.SaveFilePickerAsync(
             new FilePickerSaveOptions
             {
-                Title = "Save .UF2",
-                DefaultExtension = "uf2",
+                Title = "Save .tdld",
+                DefaultExtension = "tdld",
                 FileTypeChoices =
                 [
-                    new FilePickerFileType("UF2 Firmware Image") { Patterns = ["*.uf2"] },
+                    new FilePickerFileType("TDLD Input File") { Patterns = ["*.tdld"] },
                     new FilePickerFileType("All Files") { Patterns = ["*.*"] },
                 ],
             }
@@ -635,14 +619,8 @@ public partial class MainWindow : Window
             timingSink.ReplayTo(fileSink);
             fileSink.Dispose();
 
-            var tdldBytes = File.ReadAllBytes(tempPath);
-            var uf2Bytes = UF2Flasher.BuildTDLDUF2(tdldBytes);
-
-            if (uf2Bytes != null && uf2Bytes.Length > 0)
-            {
-                File.WriteAllBytes(outputPath, uf2Bytes);
-                AppendLog($"Saved UF2 to {outputPath}");
-            }
+            File.Copy(tempPath, outputPath, overwrite: true);
+            AppendLog($"Saved TDLD to {outputPath}");
 
             if (File.Exists(tempPath))
                 File.Delete(tempPath);
@@ -675,48 +653,53 @@ public partial class MainWindow : Window
         }
     }
 
-    private void FlashFirmwareButton_Click(object? sender, RoutedEventArgs e)
+    private async void FlashFirmwareButton_Click(object? sender, RoutedEventArgs e)
     {
-        var firmwareFilePath = GetBaseFirmwareFilePath();
-        var drivePath = UF2Flasher.FindRP2040Drive();
+        // For ESP32, the firmware is a .bin not a .uf2.
+        // The build produces three files: bootloader.bin, partition-table.bin, TomodachiDrawer.Firmware.bin
+        // All three must sit in the same folder next to the exe.
+        var binPath = Path.Combine(AppContext.BaseDirectory, "TomodachiDrawer.Firmware.bin");
 
-        if (!File.Exists(firmwareFilePath))
+        if (!File.Exists(binPath))
         {
-            _ = ShowMessageAsync(
-                "Error flashing base firmware",
-                "For some reason could not locate TomodachiDrawer.Firmware.uf2"
-                    + "\nPlease ensure that you extracted the program to a zip folder, and ran the executable from that extracted folder."
-                    + "\nIf you can still not flash with this button, you can manually drag the TomodachiDrawer.Firmware.uf2 file to the RPI-RP2 drive on your system to flash it."
-            );
-            return;
-        }
-        if (drivePath == null)
-        {
-            _ = ShowMessageAsync("Error", "RP2040 not detected. Connect it in BOOT mode first.");
+            _ = ShowMessageAsync("Error",
+                "Could not find TomodachiDrawer.Firmware.bin next to the executable.\n" +
+                "Make sure bootloader.bin and partition-table.bin are also present in the same folder.\n\n" +
+                "Alternatively, flash manually with:\n" +
+                "esptool.py --chip esp32c3 write_flash 0x10000 TomodachiDrawer.Firmware.bin");
             return;
         }
 
-        File.Copy(firmwareFilePath, Path.Combine(drivePath, firmwareFileName), overwrite: true);
+        _ = ShowMessageAsync("Put ESP32 in download mode",
+            "Before flashing the firmware, put your ESP32-C3 DevKit into download mode:\n\n" +
+            "1. Hold the BOOT button\n" +
+            "2. Press and release the RESET button\n" +
+            "3. Release the BOOT button\n\n" +
+            "Then click OK to flash.");
 
-        var timeout = System.DateTime.Now.AddSeconds(10);
-        while (UF2Flasher.FindRP2040Drive() != null)
+        FlashFirmwareButton.IsEnabled = false;
+        AppendLog("Flashing base firmware...");
+
+        var progress = new Progress<string>(AppendLog);
+        var (success, log) = await ESP32Flasher.FlashFirmwareAsync(binPath, null, progress);
+
+        FlashFirmwareButton.IsEnabled = true;
+
+        if (success)
         {
-            if (System.DateTime.Now > timeout)
-            {
-                _ = ShowMessageAsync(
-                    "Error flashing base firmware",
-                    "Wrote file but expected it to reset itself by now, maybe try doing it manually..?"
-                );
-                return;
-            }
-            Thread.Sleep(500);
+            AppendLog("Base firmware flashed successfully!");
+            _ = ShowMessageAsync("Done",
+                "Base firmware flashed!\n\n" +
+                "The board will reset automatically. " +
+                "It will flash red until you load image data onto it — that is expected.");
         }
-
-        _ = ShowMessageAsync(
-            "",
-            "Base firmware flashed! You can now use the standard output button to output your images to it!\nIf this is your first time, its likely flashing red. Simply hold BOOT and plug it back in, or hold BOOT and press reset if you have it."
-        );
-        AppendLog("Flashed base firmware to RP2040\r\n");
+        else
+        {
+            AppendLog($"Firmware flash failed:\n{log}");
+            _ = ShowMessageAsync("Flash failed",
+                "Firmware flash failed. Check the log for details.\n\n" +
+                "Make sure the board is in download mode (hold BOOT, tap RESET) and esptool is installed.");
+        }
     }
 
     private void OutputExplanationButton_Click(object? sender, RoutedEventArgs e)
